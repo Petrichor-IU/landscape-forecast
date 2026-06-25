@@ -6,6 +6,11 @@ const API = {
   forecast: "https://api.open-meteo.com/v1/forecast",
 };
 
+const LOCATION_CACHE_KEY = "landscape-location-cache-v3";
+const LOCATION_CACHE_LIMIT = 30;
+const FAST_SEARCH_TIMEOUT = 2600;
+const DETAIL_SEARCH_TIMEOUT = 3200;
+
 const SCENES = [
   { id: "sunrise", title: "朝霞", type: "日出前后", accent: "#d95b43" },
   { id: "sunset", title: "晚霞", type: "日落前后", accent: "#d48a1f" },
@@ -56,6 +61,7 @@ const state = {
   locationCandidates: [],
   selectedLocation: null,
   selectedLocationInput: "",
+  requestId: 0,
 };
 
 function pad(value) {
@@ -92,6 +98,66 @@ function coordLabel(location) {
 
 function locationDisplayName(location) {
   return [location.name, location.admin1, location.country].filter(Boolean).join(" · ");
+}
+
+async function fetchJson(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function loadLocationCache() {
+  try {
+    const raw = localStorage.getItem(LOCATION_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocationCache(cache) {
+  try {
+    const entries = Object.entries(cache)
+      .sort((a, b) => (b[1].time || 0) - (a[1].time || 0))
+      .slice(0, LOCATION_CACHE_LIMIT);
+    localStorage.setItem(LOCATION_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // Cache is only a speed-up; ignore private-mode or quota failures.
+  }
+}
+
+function getCachedLocations(input) {
+  const key = input.trim().toLowerCase();
+  const hit = loadLocationCache()[key];
+  if (!hit || !Array.isArray(hit.items)) return null;
+  return hit.items;
+}
+
+function cacheLocations(input, items) {
+  if (!items.length) return;
+  const cache = loadLocationCache();
+  cache[input.trim().toLowerCase()] = { time: Date.now(), items };
+  saveLocationCache(cache);
+}
+
+function needsDetailedLocationSearch(input, fastCandidates) {
+  if (!fastCandidates.length) return true;
+  if (fastCandidates.some((item) => item.source === "OpenStreetMap")) return false;
+  const compact = input.replace(/\s+/g, "");
+  if (/山|峰|顶|岭|谷|峡|湖|海|湾|岛|滩|瀑|寺|村|镇|景区|公园|观景|露营|草原|湿地|水库/.test(compact)) {
+    return true;
+  }
+  if (compact.length <= 4) return false;
+  return true;
 }
 
 function scoreRange(value, idealMin, idealMax, softMin, softMax) {
@@ -443,6 +509,9 @@ async function resolveLocation(input) {
   }
 
   const candidates = await searchLocations(input);
+  if (els.location.value.trim() !== input) {
+    throw Object.assign(new Error("搜索已取消"), { cancelled: true });
+  }
   if (!candidates.length) {
     hideLocationPanel();
     throw new Error("没有找到这个地点，请换一个更具体的名称或输入经纬度。");
@@ -460,12 +529,23 @@ async function resolveLocation(input) {
 }
 
 async function searchLocations(input) {
-  const [photon, nominatim, openMeteo] = await Promise.all([
+  const cached = getCachedLocations(input);
+  if (cached) return cached;
+
+  const [photon, openMeteo] = await Promise.all([
     searchPhoton(input).catch(() => []),
-    searchNominatim(input).catch(() => []),
     searchOpenMeteo(input).catch(() => []),
   ]);
-  return dedupeLocations([...photon, ...nominatim, ...openMeteo]).slice(0, 10);
+  let candidates = dedupeLocations([...photon, ...openMeteo]).slice(0, 10);
+
+  if (needsDetailedLocationSearch(input, candidates)) {
+    setStatus("正在补充精确机位候选...");
+    const nominatim = await searchNominatim(input).catch(() => []);
+    candidates = dedupeLocations([...photon, ...nominatim, ...openMeteo]).slice(0, 10);
+  }
+
+  cacheLocations(input, candidates);
+  return candidates;
 }
 
 async function searchPhoton(input) {
@@ -474,10 +554,8 @@ async function searchPhoton(input) {
     lang: "zh",
     limit: "8",
   });
-  const response = await fetch(`${API.photon}?${params}`);
-  if (!response.ok) return [];
-  const data = await response.json();
-  return (data.features || [])
+  const data = await fetchJson(`${API.photon}?${params}`, FAST_SEARCH_TIMEOUT);
+  return (data?.features || [])
     .map((feature) => {
       const [longitude, latitude] = feature.geometry?.coordinates || [];
       const props = feature.properties || {};
@@ -506,9 +584,7 @@ async function searchNominatim(input) {
     limit: "8",
     "accept-language": "zh-CN,zh,en",
   });
-  const response = await fetch(`${API.nominatim}?${params}`);
-  if (!response.ok) return [];
-  const data = await response.json();
+  const data = await fetchJson(`${API.nominatim}?${params}`, DETAIL_SEARCH_TIMEOUT);
   return (data || [])
     .map((item) => {
       const latitude = Number(item.lat);
@@ -552,10 +628,8 @@ async function searchOpenMeteo(input) {
     language: "zh",
     format: "json",
   });
-  const response = await fetch(`${API.geocode}?${params}`);
-  if (!response.ok) return [];
-  const data = await response.json();
-  return (data.results || []).map((item) => ({
+  const data = await fetchJson(`${API.geocode}?${params}`, FAST_SEARCH_TIMEOUT);
+  return (data?.results || []).map((item) => ({
     name: item.name,
     latitude: item.latitude,
     longitude: item.longitude,
@@ -676,20 +750,28 @@ function applyAutoAltitude(location, elevationResult, forecast) {
 async function runForecast(event) {
   event?.preventDefault();
   const input = els.location.value.trim();
+  const requestId = ++state.requestId;
   if (!input) {
     setStatus("请输入地点。", true);
     return;
   }
 
   try {
-    setStatus("正在获取天气和天文窗口...");
+    if (!state.selectedLocation || state.selectedLocationInput !== input) {
+      hideLocationPanel();
+      clearPredictions("正在搜索地点", "等待地点候选");
+    }
+    setStatus("正在搜索地点候选...");
     const target = new Date(els.time.value);
     if (Number.isNaN(target.getTime())) throw new Error("请选择有效时间。");
     const location = await resolveLocation(input);
+    if (requestId !== state.requestId) return;
+    setStatus("正在获取天气和天文窗口...");
     const [forecast, elevationResult] = await Promise.all([
       fetchForecast(location),
       fetchElevation(location).catch(() => null),
     ]);
+    if (requestId !== state.requestId) return;
     const firstForecast = new Date(forecast.hourly.time[0]);
     const lastForecast = new Date(forecast.hourly.time.at(-1));
     if (target < firstForecast || target > lastForecast) {
@@ -716,6 +798,7 @@ async function runForecast(event) {
     els.stageLocation.textContent = label || coordLabel(location);
     setStatus(`已完成：${label || "自定义坐标"}（${coordLabel(location)}），拍摄点海拔按 ${Math.round(altitude)} m 估算。预测是概率判断，临近日出日落前仍建议复核卫星云图。`);
   } catch (error) {
+    if (error.cancelled || requestId !== state.requestId) return;
     if (!els.locationPanel.hidden || error.message?.includes("没有找到")) {
       clearPredictions(!els.locationPanel.hidden ? "等待选择地点" : "等待预测", !els.locationPanel.hidden ? "请选择具体机位" : "选择地点与时间");
     }
@@ -788,7 +871,6 @@ function init() {
     updateAltitude("手动修正");
   });
   els.geo.addEventListener("click", useBrowserLocation);
-  runForecast();
 }
 
 init();
