@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>自然景观预测</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="control-panel" aria-label="预测设置">
+          <div class="brand-block">
+            <div class="brand-mark" aria-hidden="true"></div>
+            <div>
+              <p class="kicker">Landscape Forecast</p>
+              <h1>自然景观预测</h1>
+            </div>
+          </div>
+
+          <form id="forecast-form" class="forecast-form">
+            <label class="field">
+              <span>地点</span>
+              <div class="search-row">
+                <input
+                  id="location-input"
+                  type="search"
+                  value="杭州"
+                  autocomplete="off"
+                  placeholder="景区、山峰、观景台或经纬度"
+                />
+                <button type="button" id="geo-button" class="icon-button" title="使用当前位置" aria-label="使用当前位置">
+                  ◎
+                </button>
+              </div>
+              <small class="field-help">例如：黄山光明顶、牛背山、30.13,118.16</small>
+            </label>
+
+            <section id="location-panel" class="location-panel" hidden>
+              <div class="location-panel-head">
+                <strong>选择具体地点</strong>
+                <span id="location-count"></span>
+              </div>
+              <div id="location-options" class="location-options"></div>
+            </section>
+
+            <label class="field">
+              <span>拍摄时间</span>
+              <input id="time-input" type="datetime-local" />
+            </label>
+
+            <label class="field">
+              <span>拍摄点海拔</span>
+              <div class="range-row">
+                <input id="altitude-input" type="range" min="-200" max="4500" step="10" value="800" />
+                <output id="altitude-output">800 m</output>
+              </div>
+              <small id="altitude-source" class="field-help">会根据地点自动估算，可手动微调</small>
+            </label>
+
+            <label class="toggle-row">
+              <input id="mountain-toggle" type="checkbox" checked />
+              <span>山地/峡谷/湖泊附近，云海权重提高</span>
+            </label>
+
+            <button class="primary-action" type="submit">开始预测</button>
+          </form>
+
+          <div class="source-note">
+            <span>数据源</span>
+            <p>精确地点来自 OpenStreetMap Photon/Nominatim，天气和海拔来自 Open-Meteo。银河、月相和流星雨使用本地天文近似算法。</p>
+          </div>
+        </aside>
+
+        <section class="dashboard" aria-live="polite">
+          <div class="sky-stage" aria-hidden="true">
+            <canvas id="sky-canvas" width="1200" height="460"></canvas>
+            <div class="stage-overlay">
+              <p id="stage-label">等待预测</p>
+              <strong id="stage-location">选择地点与时间</strong>
+            </div>
+          </div>
+
+          <div id="status" class="status-line">输入地点和时间后开始预测。</div>
+
+          <section class="summary-grid" aria-label="综合天气指标">
+            <article class="metric">
+              <span>云量</span>
+              <strong id="metric-cloud">--</strong>
+            </article>
+            <article class="metric">
+              <span>湿度</span>
+              <strong id="metric-humidity">--</strong>
+            </article>
+            <article class="metric">
+              <span>能见度</span>
+              <strong id="metric-visibility">--</strong>
+            </article>
+            <article class="metric">
+              <span>月光</span>
+              <strong id="metric-moon">--</strong>
+            </article>
+          </section>
+
+          <section id="cards" class="cards" aria-label="景观概率"></section>
+        </section>
+      </section>
+    </main>
+
+    <template id="card-template">
+      <article class="prediction-card">
+        <div class="card-head">
+          <div>
+            <span class="card-type"></span>
+            <h2></h2>
+          </div>
+          <div class="score-ring" style="--score: 0">
+            <strong></strong>
+          </div>
+        </div>
+        <div class="bar" aria-hidden="true"><span></span></div>
+        <p class="verdict"></p>
+        <ul class="reasons"></ul>
+      </article>
+    </template>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
