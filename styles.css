@@ -139,6 +139,19 @@ input:focus {
   color: var(--forest);
   background: #fff;
   cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+
+.icon-button-symbol {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .range-row {
@@ -392,7 +405,8 @@ output {
 }
 
 .scene-tab-score {
-  font-size: 0.82rem;
+  font-size: 0.76rem;
+  line-height: 1.2;
   opacity: 0.82;
 }
 
