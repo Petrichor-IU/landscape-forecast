@@ -6,10 +6,10 @@ const API = {
   forecast: "https://api.open-meteo.com/v1/forecast",
 };
 
-const LOCATION_CACHE_KEY = "landscape-location-cache-v3";
+const LOCATION_CACHE_KEY = "landscape-location-cache-v4";
 const LOCATION_CACHE_LIMIT = 30;
-const FAST_SEARCH_TIMEOUT = 2600;
-const DETAIL_SEARCH_TIMEOUT = 3200;
+const FAST_SEARCH_TIMEOUT = 1900;
+const DETAIL_SEARCH_TIMEOUT = 2600;
 
 const SCENES = [
   { id: "sunrise", title: "朝霞", type: "日出前后", accent: "#d95b43" },
@@ -152,13 +152,24 @@ function cacheLocations(input, items) {
   saveLocationCache(cache);
 }
 
-function needsDetailedLocationSearch(input, fastCandidates) {
-  if (!fastCandidates.length) return true;
-  if (fastCandidates.some((item) => item.source === "OpenStreetMap")) return false;
+function isTerrainLikeInput(input) {
   const compact = input.replace(/\s+/g, "");
-  if (/山|峰|顶|岭|谷|峡|湖|海|湾|岛|滩|瀑|寺|村|镇|景区|公园|观景|露营|草原|湿地|水库/.test(compact)) {
-    return true;
-  }
+  return /山|峰|顶|岭|谷|峡|湖|海|湾|岛|滩|瀑|寺|村|镇|景区|公园|观景|露营|草原|湿地|水库/.test(compact);
+}
+
+function hasExactOsmCandidate(input, candidates) {
+  const compact = input.replace(/\s+/g, "").toLowerCase();
+  return candidates.some((item) => {
+    const name = String(item.name || "").replace(/\s+/g, "").toLowerCase();
+    return item.source === "OpenStreetMap" && (name === compact || name.includes(compact) || compact.includes(name));
+  });
+}
+
+function needsDetailedLocationSearch(input, fastCandidates) {
+  const compact = input.replace(/\s+/g, "");
+  if (!fastCandidates.length) return true;
+  if (hasExactOsmCandidate(input, fastCandidates)) return false;
+  if (isTerrainLikeInput(input)) return true;
   if (compact.length <= 4) return false;
   return true;
 }
@@ -167,6 +178,20 @@ function scoreRange(value, idealMin, idealMax, softMin, softMax) {
   if (value >= idealMin && value <= idealMax) return 100;
   if (value < idealMin) return clamp(((value - softMin) / (idealMin - softMin)) * 100);
   return clamp(((softMax - value) / (softMax - idealMax)) * 100);
+}
+
+function hourWindowScore(hour, start, end, falloffHours = 2) {
+  const candidates = [hour, hour + 24, hour - 24];
+  let best = 0;
+  candidates.forEach((candidate) => {
+    if (candidate >= start && candidate <= end) {
+      best = 100;
+      return;
+    }
+    const distance = Math.min(Math.abs(candidate - start), Math.abs(candidate - end));
+    best = Math.max(best, clamp(100 - (distance / falloffHours) * 100));
+  });
+  return best;
 }
 
 function nearestIndex(times, target) {
@@ -205,6 +230,10 @@ function getDailyFor(forecast, targetDate) {
 function mean(values) {
   const filtered = values.filter((value) => Number.isFinite(value));
   return filtered.length ? filtered.reduce((sum, value) => sum + value, 0) / filtered.length : 0;
+}
+
+function maxBy(values, scorer) {
+  return values.reduce((best, item) => (scorer(item) > scorer(best) ? item : best), values[0]);
 }
 
 function getWindow(hourly, target, beforeHours, afterHours) {
@@ -268,106 +297,215 @@ function scoreSunGap(hour, kind) {
   return lowPenalty * 0.45 + totalPenalty * 0.35 + precipitationPenalty * 0.2 + (kind === "sunset" ? 2 : 0);
 }
 
+function gateByWindow(rawScore, windowScore, strict = false) {
+  if (windowScore < 15) return Math.min(rawScore, strict ? 12 : 24);
+  if (windowScore < 45) return Math.min(rawScore, strict ? 34 : 48);
+  if (windowScore < 70) return Math.min(rawScore, 64);
+  return rawScore;
+}
+
+function darknessScore(target, daily) {
+  if (!daily?.sunrise || !daily?.sunset) return target.getHours() < 5 || target.getHours() > 21 ? 80 : 15;
+  const sunrise = new Date(daily.sunrise).getTime();
+  const sunset = new Date(daily.sunset).getTime();
+  const current = target.getTime();
+  const minutesBeforeSunrise = (sunrise - current) / 60000;
+  const minutesAfterSunset = (current - sunset) / 60000;
+
+  if (minutesBeforeSunrise >= 100 || minutesAfterSunset >= 100) return 100;
+  if (minutesBeforeSunrise > 0) return clamp((minutesBeforeSunrise / 100) * 100);
+  if (minutesAfterSunset > 0) return clamp((minutesAfterSunset / 100) * 100);
+  return 0;
+}
+
+function milkyWayCoreScore(target, latitude = 30) {
+  const month = target.getMonth() + 1;
+  const hour = target.getHours() + target.getMinutes() / 60;
+  const northernSeason = [0, 0, 12, 45, 72, 92, 100, 96, 82, 55, 24, 6, 0][month];
+  const southernSeason = [0, 55, 68, 78, 86, 92, 96, 95, 88, 75, 62, 52, 48][month];
+  const season = latitude < 0 ? southernSeason : northernSeason;
+  let timeWindow = 20;
+
+  if (month >= 3 && month <= 5) {
+    timeWindow = hourWindowScore(hour, 1.5, 4.7, 2.2);
+  } else if (month >= 6 && month <= 8) {
+    timeWindow = hourWindowScore(hour, 21.2, 27.8, 2);
+  } else if (month >= 9 && month <= 10) {
+    timeWindow = hourWindowScore(hour, 19.2, 22.3, 2);
+  }
+
+  return clamp(season * 0.68 + timeWindow * 0.32);
+}
+
+function activeMeteorScore(meteor) {
+  if (meteor.zhr <= 0 || meteor.daysFromPeak > 18) return 8;
+  const peakScore = clamp(100 - meteor.daysFromPeak * 12);
+  const strengthScore = clamp((meteor.zhr / 120) * 100);
+  return peakScore * 0.58 + strengthScore * 0.42;
+}
+
+function estimateCloudSeaLayer(hour, altitude, terrain, mountain) {
+  const humidity = hour.relative_humidity_2m ?? 0;
+  const lowCloud = hour.cloud_cover_low ?? hour.cloud_cover ?? 0;
+  const wind = hour.wind_speed_10m ?? 0;
+  const temperature = hour.temperature_2m;
+  const dewPoint = hour.dew_point_2m;
+  const spread = Number.isFinite(temperature) && Number.isFinite(dewPoint) ? Math.max(0, temperature - dewPoint) : null;
+  const lcl = spread === null ? clamp((100 - humidity) * 32, 0, 1800) : clamp(spread * 125, 0, 1800);
+  const relief = terrain?.relief ?? (mountain ? 520 : 160);
+  const terrainFloor = terrain?.min ?? altitude - relief * 0.65;
+  const valleyFloor = terrain ? terrainFloor : Math.min(terrainFloor, altitude - Math.min(relief * 0.55, mountain ? 720 : 260));
+  const base = valleyFloor + Math.min(lcl * 0.4, mountain ? 260 : 180);
+  const inversionDepth = clamp(
+    relief * 0.45 + lowCloud * 2.4 + Math.max(0, humidity - 82) * 12 - wind * 8 + lcl * 0.35,
+    mountain ? 320 : 180,
+    mountain ? 1300 : 780,
+  );
+  const top = valleyFloor + inversionDepth;
+  const thickness = Math.max(80, top - base);
+  const clearance = altitude - top;
+  let vantageScore = 8;
+
+  if (clearance >= 130) {
+    vantageScore = 100;
+  } else if (clearance >= 0) {
+    vantageScore = 62 + (clearance / 130) * 38;
+  } else if (clearance >= -180) {
+    vantageScore = 25 + ((clearance + 180) / 180) * 37;
+  }
+
+  return {
+    base,
+    top,
+    thickness,
+    clearance,
+    relief,
+    vantageScore: clamp(vantageScore),
+  };
+}
+
 function buildPredictions(context) {
-  const { hour, daily, target, hourly, altitude, mountain } = context;
+  const { hour, daily, target, hourly, altitude, mountain, terrain, location } = context;
   const midHigh = mean([hour.cloud_cover_mid ?? 0, hour.cloud_cover_high ?? 0]);
   const prettyClouds = scoreRange(midHigh, 30, 78, 0, 100);
   const lowCloudClear = scoreRange(hour.cloud_cover_low ?? 0, 0, 40, 0, 100);
   const humidityGlow = scoreRange(hour.relative_humidity_2m ?? 0, 45, 82, 15, 100);
   const visibilityKm = (hour.visibility ?? 0) / 1000;
   const visibilityScore = scoreRange(visibilityKm, 12, 40, 2, 60);
-  const windCalm = scoreRange(hour.wind_speed_10m ?? 0, 0, 13, 0, 38);
   const precipSafe = scoreRange(hour.precipitation_probability ?? 0, 0, 25, 0, 90);
   const moon = moonIllumination(target);
   const moonDark = clamp(100 - moon * 120);
-  const night = hour.is_day === 0 || target.getHours() < 5 || target.getHours() > 20;
+  const darkSky = darknessScore(target, daily);
   const meteor = meteorWindow(target);
-  const nightWindow = night ? 100 : 18;
+  const meteorActivity = activeMeteorScore(meteor);
   const recent = getWindow(hourly, target, 18, 0);
   const nextMorning = getWindow(hourly, target, 0, 9);
+  const seaCloudHour = maxBy(nextMorning.length ? nextMorning : [hour], (item) => {
+    return (item.relative_humidity_2m ?? 0) * 0.52 + (item.cloud_cover_low ?? 0) * 0.28 - (item.wind_speed_10m ?? 0) * 0.2;
+  });
   const recentRain = mean(recent.map((item) => item.precipitation_probability ?? 0));
-  const morningHumidity = mean(nextMorning.map((item) => item.relative_humidity_2m ?? 0)) || hour.relative_humidity_2m || 0;
-  const morningWind = mean(nextMorning.map((item) => item.wind_speed_10m ?? 0)) || hour.wind_speed_10m || 0;
-  const seaCloudBase =
+  const morningHumidity = mean(nextMorning.map((item) => item.relative_humidity_2m ?? 0)) || seaCloudHour.relative_humidity_2m || 0;
+  const morningWind = mean(nextMorning.map((item) => item.wind_speed_10m ?? 0)) || seaCloudHour.wind_speed_10m || 0;
+  const cloudLayer = estimateCloudSeaLayer(seaCloudHour, altitude, terrain, mountain);
+  const reliefScore = scoreRange(cloudLayer.relief, 220, 1600, 0, 2600);
+  const sunriseWindow = scoreTwilight(hour, daily, "sunrise");
+  const sunsetWindow = scoreTwilight(hour, daily, "sunset");
+  const twilightWindow = Math.max(sunriseWindow, sunsetWindow);
+  const seaCloudFormation =
     scoreRange(morningHumidity, 82, 100, 55, 100) * 0.28 +
     scoreRange(morningWind, 0, 10, 0, 28) * 0.22 +
     scoreRange(recentRain, 20, 72, 0, 100) * 0.18 +
-    lowCloudClear * 0.12 +
-    (mountain ? 12 : 0) +
-    scoreRange(altitude, 500, 2200, 0, 4200) * 0.08;
+    scoreRange(seaCloudHour.cloud_cover_low ?? 0, 35, 92, 0, 100) * 0.12 +
+    (mountain ? 8 : 0) +
+    reliefScore * 0.1;
+  let seaCloudScore = seaCloudFormation * 0.62 + cloudLayer.vantageScore * 0.38;
+  if (cloudLayer.clearance < -160) seaCloudScore = Math.min(seaCloudScore, 28);
+  if (cloudLayer.clearance >= -160 && cloudLayer.clearance < 80) seaCloudScore = Math.min(seaCloudScore, 56);
+  const milkyCore = milkyWayCoreScore(target, location?.latitude ?? 30);
 
-  const sunriseScore =
-    scoreTwilight(hour, daily, "sunrise") * 0.22 +
+  const sunriseRaw =
+    sunriseWindow * 0.22 +
     prettyClouds * 0.26 +
     scoreSunGap(hour, "sunrise") * 0.24 +
     humidityGlow * 0.14 +
     visibilityScore * 0.14;
 
-  const sunsetScore =
-    scoreTwilight(hour, daily, "sunset") * 0.22 +
+  const sunsetRaw =
+    sunsetWindow * 0.22 +
     prettyClouds * 0.26 +
     scoreSunGap(hour, "sunset") * 0.24 +
     humidityGlow * 0.14 +
     visibilityScore * 0.14;
+  const sunriseScore = gateByWindow(sunriseRaw, sunriseWindow, true);
+  const sunsetScore = gateByWindow(sunsetRaw, sunsetWindow, true);
 
-  const burningScore =
-    Math.max(sunriseScore, sunsetScore) * 0.36 +
+  const burningRaw =
+    Math.max(sunriseRaw, sunsetRaw) * 0.36 +
     scoreRange(midHigh, 42, 88, 10, 100) * 0.24 +
     lowCloudClear * 0.14 +
     humidityGlow * 0.12 +
     precipSafe * 0.14;
+  const burningScore = gateByWindow(burningRaw, twilightWindow, true);
 
-  const milkyWayScore =
-    nightWindow * 0.22 +
-    moonDark * 0.22 +
-    scoreRange(hour.cloud_cover ?? 0, 0, 18, 0, 72) * 0.2 +
-    scoreRange(hour.relative_humidity_2m ?? 0, 0, 68, 0, 98) * 0.13 +
-    visibilityScore * 0.14 +
-    windCalm * 0.09;
+  const milkyWayRaw =
+    darkSky * 0.22 +
+    moonDark * 0.2 +
+    milkyCore * 0.22 +
+    scoreRange(hour.cloud_cover ?? 0, 0, 18, 0, 72) * 0.18 +
+    scoreRange(hour.relative_humidity_2m ?? 0, 0, 68, 0, 98) * 0.1 +
+    visibilityScore * 0.08;
+  const milkyWayScore = gateByWindow(milkyWayRaw, darkSky, true);
 
-  const meteorScore =
-    meteor.strength * 0.3 +
-    nightWindow * 0.18 +
+  const meteorRaw =
+    meteorActivity * 0.32 +
+    darkSky * 0.18 +
     moonDark * 0.2 +
     scoreRange(hour.cloud_cover ?? 0, 0, 25, 0, 80) * 0.18 +
     visibilityScore * 0.14;
+  const meteorScore = gateByWindow(meteorRaw, darkSky, true);
 
   return [
     makeResult("sunrise", sunriseScore, [
-      `距日出窗口匹配度 ${Math.round(scoreTwilight(hour, daily, "sunrise"))}%`,
+      `距日出窗口匹配度 ${Math.round(sunriseWindow)}%，不在窗口内会直接压低可观测度`,
       `中高云 ${Math.round(midHigh)}%，适合被低角度阳光染色`,
       `低云 ${Math.round(hour.cloud_cover_low ?? 0)}%，决定东方低空是否透光`,
       `能见度 ${visibilityKm.toFixed(1)} km`,
     ]),
     makeResult("sunset", sunsetScore, [
-      `距日落窗口匹配度 ${Math.round(scoreTwilight(hour, daily, "sunset"))}%`,
+      `距日落窗口匹配度 ${Math.round(sunsetWindow)}%，不在窗口内会直接压低可观测度`,
       `中高云 ${Math.round(midHigh)}%，云量过少或过厚都会降分`,
       `低云 ${Math.round(hour.cloud_cover_low ?? 0)}%，决定西方低空是否透光`,
       `降水概率 ${Math.round(hour.precipitation_probability ?? 0)}%`,
     ]),
     makeResult("burning", burningScore, [
+      `日出/日落窗口匹配度 ${Math.round(twilightWindow)}%，火烧云必须接近低角度阳光窗口`,
       `强霞光依赖中高云、地平线透光和适度湿度同时出现`,
       `中高云 ${Math.round(midHigh)}%，湿度 ${Math.round(hour.relative_humidity_2m ?? 0)}%`,
       `低云 ${Math.round(hour.cloud_cover_low ?? 0)}%，过厚会挡住反射光`,
       `能见度 ${visibilityKm.toFixed(1)} km`,
     ]),
     makeResult("milkyway", milkyWayScore, [
-      night ? "当前属于夜间窗口" : "当前不是理想夜间窗口",
+      darkSky >= 75 ? "当前接近天文黑夜窗口" : "暮光或白天会显著压低银河可见度",
+      `银河核心季节/时段匹配度 ${Math.round(milkyCore)}%`,
       `月面照亮约 ${Math.round(moon * 100)}%，越接近新月越好`,
       `总云量 ${Math.round(hour.cloud_cover ?? 0)}%，星空需要尽量少云`,
       `湿度 ${Math.round(hour.relative_humidity_2m ?? 0)}%，高湿会让天空泛白并增加结露`,
     ]),
     makeResult("meteors", meteorScore, [
       `${meteor.name}，距峰值约 ${meteor.daysFromPeak} 天`,
+      `流星雨活跃度匹配 ${Math.round(meteorActivity)}%`,
       `月面照亮约 ${Math.round(moon * 100)}%`,
       `总云量 ${Math.round(hour.cloud_cover ?? 0)}%，能见度 ${visibilityKm.toFixed(1)} km`,
-      night ? "后半夜到黎明前通常更容易看到流星" : "白天或暮光时段会明显压低可见数量",
+      darkSky >= 75 ? "当前有足够暗的观测窗口" : "白天或暮光时段会明显压低可见数量",
     ]),
-    makeResult("seacloud", seaCloudBase, [
+    makeResult("seacloud", seaCloudScore, [
       `清晨湿度参考 ${Math.round(morningHumidity)}%，风速参考 ${morningWind.toFixed(1)} km/h`,
       `过去 18 小时降水概率均值 ${Math.round(recentRain)}%`,
-      mountain ? "已启用山地/峡谷/湖泊地形加权" : "未启用地形加权，云海判断更保守",
-      `拍摄点海拔按 ${Math.round(altitude)} m 估算`,
+      `估算低云层顶部约 ${Math.round(cloudLayer.top)} m，机位高出云顶约 ${Math.round(cloudLayer.clearance)} m`,
+      cloudLayer.clearance >= 80
+        ? "机位预计在云层之上，具备俯瞰云海的高度条件"
+        : "机位可能低于或处在云层内，即使有低云也不一定能看成云海",
+      terrain ? `周边地形起伏约 ${Math.round(cloudLayer.relief)} m` : "缺少周边地形采样，云海高度判断偏保守",
     ]),
   ];
 }
@@ -377,12 +515,12 @@ function makeResult(id, rawScore, reasons) {
   const score = Math.round(clamp(rawScore));
   const verdict =
     score >= 78
-      ? "值得认真准备，窗口条件比较完整。"
+      ? "观测条件比较完整，值得认真准备。"
       : score >= 58
-        ? "有机会，但需要现场观察云缝和局地变化。"
+        ? "有机会观测到，但需要现场复核云缝和局地变化。"
         : score >= 38
-          ? "概率一般，可以作为备选机位或顺路尝试。"
-          : "条件偏弱，不建议专门奔赴。";
+          ? "观测条件一般，可以作为备选机位或顺路尝试。"
+          : "当前机位观测条件偏弱，不建议专门奔赴。";
   return { ...scene, score, verdict, reasons };
 }
 
@@ -412,7 +550,7 @@ function renderSceneTabs(results) {
       <span class="scene-tab-score"></span>
     `;
     button.querySelector(".scene-tab-title").textContent = result.title;
-    button.querySelector(".scene-tab-score").textContent = `${result.score}%`;
+    button.querySelector(".scene-tab-score").textContent = `可观测 ${result.score}%`;
     els.sceneTabs.append(button);
   });
   scrollActiveSceneTab();
@@ -434,6 +572,7 @@ function renderSelectedCard() {
   node.querySelector(".card-type").textContent = result.type;
   node.querySelector("h2").textContent = result.title;
   node.querySelector(".score-ring strong").textContent = `${result.score}%`;
+  node.querySelector(".score-ring").setAttribute("aria-label", `观测可行性 ${result.score}%`);
   node.querySelector(".verdict").textContent = result.verdict;
   const list = node.querySelector(".reasons");
   result.reasons.forEach((reason) => {
@@ -582,26 +721,45 @@ async function searchLocations(input) {
   const cached = getCachedLocations(input);
   if (cached) return cached;
 
-  const [photon, openMeteo] = await Promise.all([
-    searchPhoton(input).catch(() => []),
-    searchOpenMeteo(input).catch(() => []),
-  ]);
-  let candidates = dedupeLocations([...photon, ...openMeteo]).slice(0, 10);
+  const terrainLike = isTerrainLikeInput(input);
+  if (terrainLike) setStatus("正在并行搜索精确机位...");
+  const photonTask = searchPhoton(input).catch(() => []);
+  const openMeteoTask = searchOpenMeteo(input).catch(() => []);
+  const nominatimTask = terrainLike ? searchNominatim(input).catch(() => []) : Promise.resolve([]);
+  const [photon, openMeteo, initialNominatim] = await Promise.all([photonTask, openMeteoTask, nominatimTask]);
+  let candidates = rankLocationCandidates(input, dedupeLocations([...photon, ...initialNominatim, ...openMeteo])).slice(0, 10);
 
-  if (needsDetailedLocationSearch(input, candidates)) {
+  if (!terrainLike && needsDetailedLocationSearch(input, candidates)) {
     setStatus("正在补充精确机位候选...");
     const nominatim = await searchNominatim(input).catch(() => []);
-    candidates = dedupeLocations([...photon, ...nominatim, ...openMeteo]).slice(0, 10);
+    candidates = rankLocationCandidates(input, dedupeLocations([...photon, ...nominatim, ...openMeteo])).slice(0, 10);
   }
 
   cacheLocations(input, candidates);
   return candidates;
 }
 
+function locationRank(input, location) {
+  const compact = input.replace(/\s+/g, "").toLowerCase();
+  const name = String(location.name || "").replace(/\s+/g, "").toLowerCase();
+  const detail = `${location.detail || ""} ${location.admin1 || ""}`.toLowerCase();
+  let score = 0;
+  if (name === compact) score += 90;
+  else if (name.includes(compact) || compact.includes(name)) score += 54;
+  if (location.source === "OpenStreetMap") score += 22;
+  if (/peak|mountain|hill|natural|tourism|attraction|viewpoint|park|山|峰|顶|景区|公园/.test(detail)) score += 18;
+  if (Number.isFinite(location.elevation)) score += 6;
+  if (/city|administrative|人口/.test(detail)) score -= isTerrainLikeInput(input) ? 18 : 0;
+  return score;
+}
+
+function rankLocationCandidates(input, candidates) {
+  return [...candidates].sort((a, b) => locationRank(input, b) - locationRank(input, a));
+}
+
 async function searchPhoton(input) {
   const params = new URLSearchParams({
     q: input,
-    lang: "zh",
     limit: "8",
   });
   const data = await fetchJson(`${API.photon}?${params}`, FAST_SEARCH_TIMEOUT);
@@ -781,6 +939,45 @@ async function fetchElevation(location) {
   return { value, source: "地形模型" };
 }
 
+async function fetchTerrainProfile(location) {
+  const lat = Number(location.latitude);
+  const lon = Number(location.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+  const radiusKm = 6;
+  const latStep = radiusKm / 111;
+  const lonStep = radiusKm / (111 * Math.max(Math.cos((lat * Math.PI) / 180), 0.2));
+  const points = [
+    [lat, lon],
+    [lat + latStep, lon],
+    [lat - latStep, lon],
+    [lat, lon + lonStep],
+    [lat, lon - lonStep],
+    [lat + latStep * 0.7, lon + lonStep * 0.7],
+    [lat + latStep * 0.7, lon - lonStep * 0.7],
+    [lat - latStep * 0.7, lon + lonStep * 0.7],
+    [lat - latStep * 0.7, lon - lonStep * 0.7],
+  ];
+  const params = new URLSearchParams({
+    latitude: points.map((point) => point[0].toFixed(5)).join(","),
+    longitude: points.map((point) => point[1].toFixed(5)).join(","),
+  });
+  const response = await fetch(`${API.elevation}?${params}`);
+  if (!response.ok) throw new Error("地形采样失败");
+  const data = await response.json();
+  const elevations = (data.elevation || []).filter(Number.isFinite);
+  if (elevations.length < 3) return null;
+  const min = Math.min(...elevations);
+  const max = Math.max(...elevations);
+  return {
+    min,
+    max,
+    mean: mean(elevations),
+    relief: max - min,
+    samples: elevations.length,
+  };
+}
+
 function applyAutoAltitude(location, elevationResult, forecast) {
   const key = locationKey(location);
   const autoValue = elevationResult?.value ?? forecast.elevation;
@@ -818,10 +1015,11 @@ async function runForecast(event) {
     if (Number.isNaN(target.getTime())) throw new Error("请选择有效时间。");
     const location = await resolveLocation(input);
     if (requestId !== state.requestId) return;
-    setStatus("正在获取天气和天文窗口...");
-    const [forecast, elevationResult] = await Promise.all([
+    setStatus("正在获取天气、地形和天文窗口...");
+    const [forecast, elevationResult, terrain] = await Promise.all([
       fetchForecast(location),
       fetchElevation(location).catch(() => null),
+      fetchTerrainProfile(location).catch(() => null),
     ]);
     if (requestId !== state.requestId) return;
     const firstForecast = new Date(forecast.hourly.time[0]);
@@ -840,6 +1038,8 @@ async function runForecast(event) {
       hourly: forecast.hourly,
       altitude,
       mountain: els.mountain.checked,
+      terrain,
+      location,
     };
     const results = buildPredictions(context);
     const label = locationDisplayName(location);
@@ -848,7 +1048,7 @@ async function runForecast(event) {
     drawSky(results, hour, target);
     els.stageLabel.textContent = `${humanDateTime(target)} · 模型小时 ${hour.time.replace("T", " ")}`;
     els.stageLocation.textContent = label || coordLabel(location);
-    setStatus(`已完成：${label || "自定义坐标"}（${coordLabel(location)}），拍摄点海拔按 ${Math.round(altitude)} m 估算。预测是概率判断，临近日出日落前仍建议复核卫星云图。`);
+    setStatus(`已完成：${label || "自定义坐标"}（${coordLabel(location)}），拍摄点海拔按 ${Math.round(altitude)} m 估算。结果表示当前机位的观测可行性，临近日出日落前仍建议复核卫星云图。`);
   } catch (error) {
     if (error.cancelled || requestId !== state.requestId) return;
     if (!els.locationPanel.hidden || error.message?.includes("没有找到")) {
