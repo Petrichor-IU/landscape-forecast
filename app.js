@@ -43,6 +43,7 @@ const els = {
   geo: document.querySelector("#geo-button"),
   status: document.querySelector("#status"),
   cards: document.querySelector("#cards"),
+  sceneTabs: document.querySelector("#scene-tabs"),
   template: document.querySelector("#card-template"),
   canvas: document.querySelector("#sky-canvas"),
   stageLabel: document.querySelector("#stage-label"),
@@ -62,6 +63,8 @@ const state = {
   selectedLocation: null,
   selectedLocationInput: "",
   requestId: 0,
+  selectedSceneId: "",
+  latestResults: [],
 };
 
 function pad(value) {
@@ -384,22 +387,69 @@ function makeResult(id, rawScore, reasons) {
 }
 
 function renderCards(results) {
-  els.cards.innerHTML = "";
+  state.latestResults = results;
+  if (!results.some((result) => result.id === state.selectedSceneId)) {
+    state.selectedSceneId = [...results].sort((a, b) => b.score - a.score)[0]?.id || results[0]?.id || "";
+  }
+  renderSceneTabs(results);
+  renderSelectedCard();
+}
+
+function renderSceneTabs(results) {
+  els.sceneTabs.innerHTML = "";
   results.forEach((result) => {
-    const node = els.template.content.firstElementChild.cloneNode(true);
-    node.style.setProperty("--accent", result.accent);
-    node.style.setProperty("--score", result.score);
-    node.querySelector(".card-type").textContent = result.type;
-    node.querySelector("h2").textContent = result.title;
-    node.querySelector(".score-ring strong").textContent = `${result.score}%`;
-    node.querySelector(".verdict").textContent = result.verdict;
-    const list = node.querySelector(".reasons");
-    result.reasons.forEach((reason) => {
-      const li = document.createElement("li");
-      li.textContent = reason;
-      list.append(li);
-    });
-    els.cards.append(node);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "scene-tab";
+    button.dataset.sceneId = result.id;
+    button.id = `tab-${result.id}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(result.id === state.selectedSceneId));
+    button.setAttribute("aria-controls", "cards");
+    button.style.setProperty("--accent", result.accent);
+    button.innerHTML = `
+      <span class="scene-tab-title"></span>
+      <span class="scene-tab-score"></span>
+    `;
+    button.querySelector(".scene-tab-title").textContent = result.title;
+    button.querySelector(".scene-tab-score").textContent = `${result.score}%`;
+    els.sceneTabs.append(button);
+  });
+  scrollActiveSceneTab();
+}
+
+function renderSelectedCard() {
+  const result = state.latestResults.find((item) => item.id === state.selectedSceneId) || state.latestResults[0];
+  els.cards.innerHTML = "";
+  if (!result) return;
+  [...els.sceneTabs.querySelectorAll(".scene-tab")].forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.sceneId === result.id));
+  });
+  scrollActiveSceneTab();
+  const node = els.template.content.firstElementChild.cloneNode(true);
+  node.style.setProperty("--accent", result.accent);
+  node.style.setProperty("--score", result.score);
+  node.setAttribute("role", "tabpanel");
+  node.setAttribute("aria-labelledby", `tab-${result.id}`);
+  node.querySelector(".card-type").textContent = result.type;
+  node.querySelector("h2").textContent = result.title;
+  node.querySelector(".score-ring strong").textContent = `${result.score}%`;
+  node.querySelector(".verdict").textContent = result.verdict;
+  const list = node.querySelector(".reasons");
+  result.reasons.forEach((reason) => {
+    const li = document.createElement("li");
+    li.textContent = reason;
+    list.append(li);
+  });
+  els.cards.append(node);
+}
+
+function scrollActiveSceneTab() {
+  const active = els.sceneTabs.querySelector('.scene-tab[aria-selected="true"]');
+  if (!active) return;
+  window.requestAnimationFrame(() => {
+    const left = active.offsetLeft - (els.sceneTabs.clientWidth - active.offsetWidth) / 2;
+    els.sceneTabs.scrollTo({ left: Math.max(0, left), behavior: "smooth" });
   });
 }
 
@@ -685,6 +735,8 @@ function hideLocationPanel() {
 
 function clearPredictions(label = "等待预测", location = "选择地点与时间") {
   els.cards.innerHTML = "";
+  els.sceneTabs.innerHTML = "";
+  state.latestResults = [];
   els.metrics.cloud.textContent = "--";
   els.metrics.humidity.textContent = "--";
   els.metrics.visibility.textContent = "--";
@@ -865,6 +917,12 @@ function init() {
     state.selectedLocationInput = els.location.value.trim();
     hideLocationPanel();
     runForecast();
+  });
+  els.sceneTabs.addEventListener("click", (event) => {
+    const button = event.target.closest(".scene-tab");
+    if (!button) return;
+    state.selectedSceneId = button.dataset.sceneId;
+    renderSelectedCard();
   });
   els.altitude.addEventListener("input", () => {
     state.altitudeTouched = true;
